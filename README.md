@@ -12,7 +12,7 @@ A Telegram bot for common image and document tasks. The project is public and we
 
 ### Image size notes
 
-The size presets are target ceilings, not promises of exact file size. Compression exports JPEG and reduces quality first; if necessary to meet the selected ceiling, it also reduces pixel dimensions. Converting a photo to a different format does not inherently increase its visual quality. Telegram photo uploads may already be resized/compressed; send as a document when you need to preserve the original bytes (subject to the bot's input limit).
+The size presets are target ceilings, not promises of exact file size. Compression exports JPEG and reduces quality first; if necessary to meet the selected ceiling, it also reduces pixel dimensions. Transparent PNG/WebP conversion preserves alpha; JPEG conversion flattens transparency onto white. Telegram photo uploads may already be resized/compressed; send as a document when you need to preserve original bytes (subject to the bot's input limit).
 
 ## Requirements
 
@@ -23,20 +23,31 @@ The size presets are target ceilings, not promises of exact file size. Compressi
 
 1. Clone the repository and enter its directory.
 2. Create and activate a virtual environment.
-3. Install dependencies: pip install -r requirements.txt
-4. Copy .env.example to .env and set BOT_TOKEN to your token.
-5. Start: python bot.py
+3. Install dependencies: `python -m pip install -r requirements.txt`
+4. Copy `.env.example` to `.env` and set `BOT_TOKEN` to your token.
+5. Start: `python bot.py`
 
-Never commit .env or share your token. If a token is exposed, revoke it in @BotFather and create a replacement.
+Never commit `.env` or share your token. If a token is exposed, revoke it in @BotFather and create a replacement.
+
+## Run with Docker Compose
+
+Install Docker Compose, create `.env` with `BOT_TOKEN=your_token`, then run:
+
+```sh
+docker compose up --build -d
+docker compose logs -f bot
+```
+
+Stop with `docker compose down`. The bot uses long polling; run only one active instance for a given bot token.
 
 ## Deploy on Render
 
 Create a **Background Worker** connected to this repository and the main branch.
 
 - Runtime: Python
-- Build command: pip install -r requirements.txt
-- Start command: python bot.py
-- Environment variable: BOT_TOKEN = your token
+- Build command: `pip install -r requirements.txt`
+- Start command: `python bot.py`
+- Environment variable: `BOT_TOKEN` = your token
 - Root directory: leave blank (repository root)
 
 This bot uses long polling, so use one running worker instance for the bot token. Do not run multiple replicas of this polling bot simultaneously.
@@ -46,7 +57,18 @@ This bot uses long polling, so use one running worker instance for the bot token
 - Hosted Telegram Bot API input download limit is configured conservatively at 19 MB per file.
 - Maximum batch size: 8 files.
 - Batch/session data is currently held in process memory; active batches are lost on restart. Local temporary files are not a durable storage layer.
-- This is an early-stage project, not yet validated for high-volume or multi-instance production. Before scaling, add persistent session storage, queueing, rate limits, automated tests, and storage lifecycle controls.
+- Temporary files are cleaned on orderly shutdown; a crash can leave stale files. Periodic cleanup and persistent session storage are future hardening work.
+- This is an early-stage project, not yet validated for high-volume or multi-instance production. Before scaling, add persistent sessions, queueing, rate limits, storage lifecycle controls, and monitoring.
+
+## Tests
+
+Run locally with:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions runs this test command for pushes to `main` and pull requests targeting `main`.
 
 ## Contributing
 
