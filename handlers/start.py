@@ -29,5 +29,5 @@ async def help_handler(message: Message) -> None:
         "3. Send files, then /zip to archive the batch.\n"
         "4. Use /clear to remove the batch without processing.\n\n"
         "Limits: 19 MB per input file and 8 files per batch. Compression targets are maximums, not guaranteed exact sizes; reducing size can reduce image quality. "
-        "Only use files you have the right to process."
+        "Background removal needs the optional requirements-ai.txt install and may be resource-intensive. Only use files you have the right to process."
     )
