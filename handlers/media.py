@@ -14,6 +14,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import MAX_FILE_SIZE_BYTES, MAX_BATCH_FILES, TEMP_DIR
 from services.file_compressor import create_zip
 from services.image_converter import compress_to_target, convert_image
+from services.image_editing import edit_image, remove_background
 from services.pdf_tools import merge_pdfs
 from utils.file_manager import remove_path, safe_suffix
 
@@ -38,7 +39,7 @@ def _keyboard(token: str):
         builder.button(text=label, callback_data=f"img:{token}:{fmt}")
     for label, kb in (("≤250 KB", "250"), ("≤500 KB", "500"), ("≤1 MB", "1024"), ("≤2 MB", "2048")):
         builder.button(text=label, callback_data=f"img:{token}:kb{kb}")
-    builder.adjust(3, 2, 2)
+    for label, action in (("Rotate 90°", "rotate"), ("Mirror", "flip"), ("Flip", "flop"), ("Grayscale", "gray"), ("Sepia", "sepia"), ("Blur", "blur"), ("Sharpen", "sharpen"), ("Brighten", "bright"), ("Darken", "dark"), ("Contrast", "contrast"), ("Saturate", "saturate"), ("Auto contrast", "autocontrast"), ("Remove BG", "bg")):\n        builder.button(text=label, callback_data=f"edit:{token}:{action}")\n    builder.adjust(3, 2, 2, 2, 2, 2, 2, 2)
     return builder.as_markup()
 
 
@@ -149,6 +150,75 @@ async def image_conversion_callback(callback: CallbackQuery) -> None:
         remove_path(source)
         remove_path(target)
     await callback.answer()
+
+
+@router.callback_query(lambda c: c.data is not None and c.data.startswith("edit:"))
+async def image_edit_callback(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid action.", show_alert=True)
+        return
+    _, token, action = parts
+    entry = _image_tokens.get(token)
+    allowed = {"rotate", "flip", "flop", "gray", "invert", "autocontrast", "blur", "sharpen",
+               "bright", "dark", "contrast", "saturate", "sepia", "bg"}
+    if action not in allowed or not entry or entry[0] != callback.from_user.id:
+        await callback.answer("This image action is invalid or expired.", show_alert=True)
+        return
+    source = entry[1]
+    target = source.with_name(f"{uuid4().hex}.png")
+    try:
+        async with _job_slots:
+            if action == "bg":
+                await asyncio.to_thread(remove_background, source, target)
+            else:
+                await asyncio.to_thread(edit_image, source, target, action)
+        if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+            await callback.message.answer("Edited image exceeds the bot's send limit.")
+        else:
+            await callback.message.answer_document(FSInputFile(target), caption=f"Image edit: {action}")
+    except RuntimeError as exc:
+        await callback.message.answer(str(exc))
+    except Exception:
+        log.exception("Image edit failed for user_id=%s", callback.from_user.id)
+        await callback.message.answer("Couldn't edit this image. Try another image.")
+    finally:
+        remove_path(target)
+    await callback.answer()
+
+
+@router.message(Command("resize"))
+async def resize_handler(message: Message) -> None:
+    if not message.from_user:
+        return
+    args = (message.text or "").split()
+    if len(args) != 3 or not all(arg.isdigit() for arg in args[1:]):
+        await message.answer("Usage: /resize WIDTH HEIGHT (pixels), e.g. /resize 1200 800. Send a photo first.")
+        return
+    width, height = int(args[1]), int(args[2])
+    token_entry = next((entry for entry in reversed(list(_image_tokens.values())) if entry[0] == message.from_user.id), None)
+    if not token_entry:
+        await message.answer("Send a photo first, then use /resize WIDTH HEIGHT.")
+        return
+    source = token_entry[1]
+    target = source.with_name(f"{uuid4().hex}.png")
+    try:
+        async with _job_slots:
+            await asyncio.to_thread(edit_image, source, target, "resize", width, height)
+        if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+            await message.answer("Resized image exceeds the bot's send limit.")
+        else:
+            await message.answer_document(FSInputFile(target), caption=f"Resized to {width} × {height} px")
+    except ValueError as exc:
+        await message.answer(str(exc))
+    except Exception:
+        log.exception("Manual resize failed for user_id=%s", message.from_user.id)
+        await message.answer("Couldn't resize this image.")
+    finally:
+        remove_path(target)
 
 
 async def _take_batch(user_id: int) -> list[Path]:
