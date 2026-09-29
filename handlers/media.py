@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import MAX_FILE_SIZE_BYTES, MAX_BATCH_FILES, TEMP_DIR
 from services.file_compressor import create_zip
-from services.image_converter import convert_image
+from services.image_converter import compress_to_target, convert_image
 from services.pdf_tools import merge_pdfs
 from utils.file_manager import remove_path, safe_suffix
 
@@ -36,7 +36,9 @@ def _keyboard(token: str):
     builder = InlineKeyboardBuilder()
     for label, fmt in (("PNG", "png"), ("JPG", "jpg"), ("WebP", "webp")):
         builder.button(text=label, callback_data=f"img:{token}:{fmt}")
-    builder.adjust(3)
+    for label, kb in (("≤250 KB", "250"), ("≤500 KB", "500"), ("≤1 MB", "1024"), ("≤2 MB", "2048")):
+        builder.button(text=label, callback_data=f"img:{token}:kb{kb}")
+    builder.adjust(3, 2, 2)
     return builder.as_markup()
 
 
@@ -120,19 +122,26 @@ async def image_conversion_callback(callback: CallbackQuery) -> None:
         return
     _, token, fmt = parts
     entry = _image_tokens.get(token)
-    if fmt not in {"png", "jpg", "webp"} or not entry or entry[0] != callback.from_user.id:
+    size_request = fmt.startswith("kb") and fmt[2:].isdigit()
+    if (fmt not in {"png", "jpg", "webp"} and not size_request) or not entry or entry[0] != callback.from_user.id:
         await callback.answer("This image action is invalid or expired.", show_alert=True)
         return
     _image_tokens.pop(token, None)
     source = entry[1]
-    target = source.with_name(f"{uuid4().hex}.{fmt}")
+    target = source.with_name(f"{uuid4().hex}.jpg" if size_request else f"{uuid4().hex}.{fmt}")
     try:
         async with _job_slots:
-            await asyncio.to_thread(convert_image, source, target, fmt)
-        if target.stat().st_size > MAX_FILE_SIZE_BYTES:
-            await callback.message.answer("Converted output exceeds the bot's send limit.")
+            if size_request:
+                actual_bytes = await asyncio.to_thread(compress_to_target, source, target, int(fmt[2:]) * 1024)
+            else:
+                await asyncio.to_thread(convert_image, source, target, fmt)
+                actual_bytes = target.stat().st_size
+        if actual_bytes > MAX_FILE_SIZE_BYTES:
+            await callback.message.answer("Output exceeds the bot's send limit. Choose a smaller target size.")
         else:
-            await callback.message.answer_document(FSInputFile(target), caption=f"Converted to {fmt.upper()}")
+            caption = (f"JPEG optimized: {actual_bytes / 1024:.1f} KB (requested ≤ {int(fmt[2:])} KB)."
+                       if size_request else f"Converted to {fmt.upper()} ({actual_bytes / 1024:.1f} KB)")
+            await callback.message.answer_document(FSInputFile(target), caption=caption)
     except Exception:
         log.exception("Image conversion failed for user_id=%s", callback.from_user.id)
         await callback.message.answer("Image conversion failed. Try another image or format.")
