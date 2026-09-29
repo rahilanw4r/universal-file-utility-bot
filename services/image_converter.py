@@ -8,12 +8,19 @@ from PIL import Image, ImageOps
 FORMAT_MAP = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
 
 
-def _load_rgb(source: Path) -> Image.Image:
+def _load_image(source: Path) -> Image.Image:
     with Image.open(source) as opened:
         opened.verify()
     with Image.open(source) as opened:
         image = ImageOps.exif_transpose(opened)
         image.load()
+        return image.copy()
+
+
+def _load_rgb(source: Path) -> Image.Image:
+    """Load and flatten transparency onto white for JPEG compression."""
+    image = _load_image(source)
+    try:
         if image.mode in ("RGBA", "LA") or "transparency" in image.info:
             rgba = image.convert("RGBA")
             background = Image.new("RGB", rgba.size, "white")
@@ -21,6 +28,8 @@ def _load_rgb(source: Path) -> Image.Image:
             rgba.close()
             return background
         return image.convert("RGB")
+    finally:
+        image.close()
 
 
 def convert_image(source: Path, target: Path, output_format: str) -> None:
@@ -28,12 +37,17 @@ def convert_image(source: Path, target: Path, output_format: str) -> None:
     ext = ".jpg" if output_format == "jpg" else f".{output_format}"
     if ext not in FORMAT_MAP:
         raise ValueError("Unsupported image format.")
-    with _load_rgb(source) as image:
-        fmt = FORMAT_MAP[ext]
-        options = {"quality": 90, "optimize": True} if fmt == "JPEG" else {}
-        if fmt == "WEBP":
-            options = {"quality": 90, "method": 4}
-        image.save(target, format=fmt, **options)
+    fmt = FORMAT_MAP[ext]
+    with _load_image(source) as image:
+        if fmt == "JPEG":
+            with _load_rgb(source) as rgb:
+                rgb.save(target, format=fmt, quality=90, optimize=True)
+        else:
+            # Preserve alpha for PNG/WebP instead of flattening transparent pixels.
+            if fmt == "PNG" and image.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            options = {"quality": 90, "method": 4} if fmt == "WEBP" else {}
+            image.save(target, format=fmt, **options)
 
 
 def compress_to_target(source: Path, target: Path, target_bytes: int) -> int:
