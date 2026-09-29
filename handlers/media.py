@@ -39,7 +39,9 @@ def _keyboard(token: str):
         builder.button(text=label, callback_data=f"img:{token}:{fmt}")
     for label, kb in (("≤250 KB", "250"), ("≤500 KB", "500"), ("≤1 MB", "1024"), ("≤2 MB", "2048")):
         builder.button(text=label, callback_data=f"img:{token}:kb{kb}")
-    for label, action in (("Rotate 90°", "rotate"), ("Mirror", "flip"), ("Flip", "flop"), ("Grayscale", "gray"), ("Sepia", "sepia"), ("Blur", "blur"), ("Sharpen", "sharpen"), ("Brighten", "bright"), ("Darken", "dark"), ("Contrast", "contrast"), ("Saturate", "saturate"), ("Auto contrast", "autocontrast"), ("Remove BG", "bg")):\n        builder.button(text=label, callback_data=f"edit:{token}:{action}")\n    builder.adjust(3, 2, 2, 2, 2, 2, 2, 2)
+    for label, action in (("Rotate 90°", "rotate"), ("Mirror", "flip"), ("Flip", "flop"), ("Grayscale", "gray"), ("Sepia", "sepia"), ("Blur", "blur"), ("Sharpen", "sharpen"), ("Brighten", "bright"), ("Darken", "dark"), ("Contrast", "contrast"), ("Saturate", "saturate"), ("Auto contrast", "autocontrast"), ("Remove BG", "bg")):
+        builder.button(text=label, callback_data=f"edit:{token}:{action}")
+    builder.adjust(3, 2, 2, 2, 2, 2, 2, 2)
     return builder.as_markup()
 
 
