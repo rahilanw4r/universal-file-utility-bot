@@ -1,185 +1,227 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
 from aiogram import Router
+from aiogram.filters import Command
 from aiogram.types import CallbackQuery, FSInputFile, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import MAX_FILE_SIZE_BYTES, TEMP_DIR
+from config import MAX_FILE_SIZE_BYTES, MAX_BATCH_FILES, TEMP_DIR
 from services.file_compressor import create_zip
 from services.image_converter import convert_image
-from services.pdf_tools import images_to_pdf, merge_pdfs
-from utils.file_manager import remove_path
+from services.pdf_tools import merge_pdfs
+from utils.file_manager import remove_path, safe_suffix
 
 router = Router()
+log = logging.getLogger(__name__)
 
-user_batches: dict[int, list[Path]] = {}
-user_batch_types: dict[int, str] = {}
-job_semaphore = asyncio.Semaphore(2)
+# State is isolated per Telegram user within this single bot process.
+# For multiple replicas, move sessions/locks to Redis or a database.
+_batches: dict[int, list[Path]] = {}
+_image_tokens: dict[str, tuple[int, Path]] = {}
+_user_locks: dict[int, asyncio.Lock] = {}
+_job_slots = asyncio.Semaphore(2)
 
 
-def action_keyboard():
+def _lock_for(user_id: int) -> asyncio.Lock:
+    return _user_locks.setdefault(user_id, asyncio.Lock())
+
+
+def _keyboard(token: str):
     builder = InlineKeyboardBuilder()
-    for label, callback in [
-        ("PNG", "img:png"),
-        ("JPG", "img:jpg"),
-        ("WebP", "img:webp"),
-    ]:
-        builder.button(text=label, callback_data=callback)
+    for label, fmt in (("PNG", "png"), ("JPG", "jpg"), ("WebP", "webp")):
+        builder.button(text=label, callback_data=f"img:{token}:{fmt}")
     builder.adjust(3)
     return builder.as_markup()
 
 
-async def check_size(message: Message, size: int | None) -> bool:
+async def _reject_size(message: Message, size: int | None) -> bool:
     if size is not None and size > MAX_FILE_SIZE_BYTES:
-        await message.answer(
-            f"File is too large. Maximum supported input size is "
-            f"{MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB."
-        )
-        return False
-    return True
+        await message.answer(f"Input limit is {MAX_FILE_SIZE_BYTES // 1048576} MB per file. Send a smaller file.")
+        return True
+    return False
 
 
-@router.message(lambda message: message.document is not None)
+async def _download(message: Message, file_id: str, dest: Path) -> None:
+    tg_file = await message.bot.get_file(file_id)
+    await message.bot.download(tg_file, destination=dest)
+    # Defense in depth: reject missing/incorrect Telegram metadata after download.
+    if not dest.is_file() or dest.stat().st_size > MAX_FILE_SIZE_BYTES:
+        remove_path(dest)
+        raise ValueError("File exceeds the configured input limit.")
+
+
+@router.message(lambda m: m.document is not None)
 async def document_handler(message: Message) -> None:
-    document = message.document
-    if not await check_size(message, document.file_size):
+    if not message.from_user or not message.document:
         return
-
+    doc = message.document
+    if await _reject_size(message, doc.file_size):
+        return
     user_id = message.from_user.id
     workdir = TEMP_DIR / str(user_id)
     workdir.mkdir(parents=True, exist_ok=True)
-
-    suffix = Path(document.file_name or "file.bin").suffix.lower()
-    destination = workdir / f"{uuid4().hex}{suffix or '.bin'}"
-
-    async with job_semaphore:
-        try:
-            tg_file = await message.bot.get_file(document.file_id)
-            await message.bot.download(tg_file, destination)
-
-            batch = user_batches.setdefault(user_id, [])
-            batch.append(destination)
-
-            file_type = "pdf" if suffix == ".pdf" else "other"
-            user_batch_types[user_id] = file_type
-
+    dest = workdir / f"{uuid4().hex}{safe_suffix(doc.file_name or 'file.bin')}"
+    try:
+        async with _user_locks.setdefault(user_id, asyncio.Lock()):
+            if len(_batches.get(user_id, [])) >= MAX_BATCH_FILES:
+                await message.answer(f"Batch limit is {MAX_BATCH_FILES} files. Use /zip or /mergepdf to finish the current batch.")
+                return
+            async with _job_slots:
+                await _download(message, doc.file_id, dest)
+            _batches.setdefault(user_id, []).append(dest)
             await message.answer(
-                f"Received {document.file_name or 'file'}\n"
-                f"Batch now contains {len(batch)} file(s).\n\n"
-                "Use /mergepdf for PDFs or /zip to create a ZIP archive."
+                f"Added: {Path(doc.file_name or 'file').name}\n"
+                f"Batch: {len(_batches[user_id])}/{MAX_BATCH_FILES}\n"
+                "Use /zip to archive files, /mergepdf for 2+ PDFs, or /clear to discard the batch."
             )
-        except Exception as exc:
-            remove_path(destination)
-            await message.answer(f"Could not download the file: {exc}")
+    except Exception:
+        remove_path(dest)
+        log.exception("Document handling failed for user_id=%s", user_id)
+        await message.answer("I couldn't download or add that file. Check the file size and try again.")
 
 
-@router.message(lambda message: message.photo is not None)
+@router.message(lambda m: m.photo is not None)
 async def photo_handler(message: Message) -> None:
-    photo = message.photo[-1]
-    if not await check_size(message, photo.file_size):
+    if not message.from_user or not message.photo:
         return
-
+    photo = message.photo[-1]
+    if await _reject_size(message, photo.file_size):
+        return
     user_id = message.from_user.id
     workdir = TEMP_DIR / str(user_id)
     workdir.mkdir(parents=True, exist_ok=True)
-    source = workdir / f"{uuid4().hex}.jpg"
-
-    async with job_semaphore:
-        try:
-            tg_file = await message.bot.get_file(photo.file_id)
-            await message.bot.download(tg_file, source)
-            await message.answer(
-                "Choose the output format:",
-                reply_markup=action_keyboard(),
-            )
-        except Exception as exc:
-            remove_path(source)
-            await message.answer(f"Could not process the image: {exc}")
+    source = workdir / f"{uuid4().hex}.img"
+    token = uuid4().hex[:16]
+    try:
+        async with _job_slots:
+            await _download(message, photo.file_id, source)
+        _image_tokens[token] = (user_id, source)
+        await message.answer("Choose output format:", reply_markup=_keyboard(token))
+    except Exception:
+        remove_path(source)
+        log.exception("Photo download failed for user_id=%s", user_id)
+        await message.answer("I couldn't download that image. Please try sending it again.")
 
 
-@router.callback_query(lambda callback: callback.data and callback.data.startswith("img:"))
+@router.callback_query(lambda c: c.data is not None and c.data.startswith("img:"))
 async def image_conversion_callback(callback: CallbackQuery) -> None:
-    if not callback.message:
+    if not callback.data or not callback.message:
         await callback.answer()
         return
-
-    target_format = callback.data.split(":", 1)[1]
-    user_id = callback.from_user.id
-    workdir = TEMP_DIR / str(user_id)
-
-    images = sorted(workdir.glob("*.jpg"))
-    if not images:
-        await callback.answer("Image expired. Please send it again.", show_alert=True)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid action.", show_alert=True)
         return
-
-    source = images[-1]
-    target = workdir / f"{uuid4().hex}.{target_format}"
-
-    async with job_semaphore:
-        try:
-            convert_image(source, target, target_format)
-            await callback.message.answer_document(
-                FSInputFile(target),
-                caption=f"Converted to {target_format.upper()}",
-            )
-        except Exception as exc:
-            await callback.message.answer(f"Conversion failed: {exc}")
-        finally:
-            remove_path(source)
-            remove_path(target)
-
+    _, token, fmt = parts
+    entry = _image_tokens.get(token)
+    if fmt not in {"png", "jpg", "webp"} or not entry or entry[0] != callback.from_user.id:
+        await callback.answer("This image action is invalid or expired.", show_alert=True)
+        return
+    _image_tokens.pop(token, None)
+    source = entry[1]
+    target = source.with_name(f"{uuid4().hex}.{fmt}")
+    try:
+        async with _job_slots:
+            await asyncio.to_thread(convert_image, source, target, fmt)
+        if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+            await callback.message.answer("Converted output exceeds the bot's send limit.")
+        else:
+            await callback.message.answer_document(FSInputFile(target), caption=f"Converted to {fmt.upper()}")
+    except Exception:
+        log.exception("Image conversion failed for user_id=%s", callback.from_user.id)
+        await callback.message.answer("Image conversion failed. Try another image or format.")
+    finally:
+        remove_path(source)
+        remove_path(target)
     await callback.answer()
 
 
-@router.message(lambda message: message.text and message.text.strip().lower() == "/mergepdf")
-async def merge_pdf_handler(message: Message) -> None:
-    user_id = message.from_user.id
-    batch = user_batches.get(user_id, [])
+async def _take_batch(user_id: int) -> list[Path]:
+    async with _lock_for(user_id):
+        return _batches.pop(user_id, [])
 
-    if len(batch) < 2 or not all(path.suffix.lower() == ".pdf" for path in batch):
-        await message.answer("Send at least two PDF files first, then use /mergepdf.")
+
+@router.message(Command("clear"))
+async def clear_handler(message: Message) -> None:
+    if not message.from_user:
         return
-
-    target = batch[0].parent / f"{uuid4().hex}.pdf"
-
-    async with job_semaphore:
-        try:
-            merge_pdfs(batch, target)
-            await message.answer_document(FSInputFile(target), caption="Merged PDF")
-        except Exception as exc:
-            await message.answer(f"PDF merge failed: {exc}")
-        finally:
-            for path in batch:
-                remove_path(path)
-            remove_path(target)
-            user_batches.pop(user_id, None)
-            user_batch_types.pop(user_id, None)
+    files = await _take_batch(message.from_user.id)
+    for path in files:
+        remove_path(path)
+    await message.answer(f"Cleared {len(files)} file(s) from your batch.")
 
 
-@router.message(lambda message: message.text and message.text.strip().lower() == "/zip")
+@router.message(Command("zip"))
 async def zip_handler(message: Message) -> None:
-    user_id = message.from_user.id
-    batch = user_batches.get(user_id, [])
-
-    if not batch:
-        await message.answer("Send one or more files first, then use /zip.")
+    if not message.from_user:
         return
-
-    target = batch[0].parent / f"{uuid4().hex}.zip"
-
-    async with job_semaphore:
+    user_id = message.from_user.id
+    async with _lock_for(user_id):
+        batch = list(_batches.get(user_id, []))
+        if not batch:
+            await message.answer("Send files first, then use /zip.")
+            return
+        target = batch[0].parent / f"{uuid4().hex}.zip"
         try:
-            create_zip(batch, target)
-            await message.answer_document(FSInputFile(target), caption="ZIP archive")
-        except Exception as exc:
-            await message.answer(f"ZIP creation failed: {exc}")
+            async with _job_slots:
+                await asyncio.to_thread(create_zip, batch, target)
+            if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+                await message.answer("The ZIP is larger than the bot's send limit. Try fewer or smaller files.")
+                return
+            await message.answer_document(FSInputFile(target), caption="Your ZIP archive")
+            _batches.pop(user_id, None)
+        except Exception:
+            log.exception("ZIP creation failed for user_id=%s", user_id)
+            await message.answer("Couldn't create the ZIP. Check that the files are valid and try again.")
         finally:
-            for path in batch:
-                remove_path(path)
             remove_path(target)
-            user_batches.pop(user_id, None)
-            user_batch_types.pop(user_id, None)
+            if user_id not in _batches:
+                for path in batch:
+                    remove_path(path)
+
+
+@router.message(Command("mergepdf"))
+async def merge_pdf_handler(message: Message) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    async with _lock_for(user_id):
+        batch = list(_batches.get(user_id, []))
+        if len(batch) < 2 or not all(p.suffix.lower() == ".pdf" for p in batch):
+            await message.answer("Send at least two PDF documents (as files), then use /mergepdf.")
+            return
+        target = batch[0].parent / f"{uuid4().hex}.pdf"
+        try:
+            async with _job_slots:
+                await asyncio.to_thread(merge_pdfs, batch, target)
+            if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+                await message.answer("Merged PDF is larger than the bot's send limit. Try fewer or smaller PDFs.")
+                return
+            await message.answer_document(FSInputFile(target), caption="Merged PDF")
+            _batches.pop(user_id, None)
+        except Exception:
+            log.exception("PDF merge failed for user_id=%s", user_id)
+            await message.answer("Couldn't merge those PDFs. One may be damaged or encrypted.")
+        finally:
+            remove_path(target)
+            if user_id not in _batches:
+                for path in batch:
+                    remove_path(path)
+
+
+async def cleanup() -> None:
+    # Best-effort shutdown cleanup; persistent storage/queue is needed for restart recovery.
+    for files in _batches.values():
+        for path in files:
+            remove_path(path)
+    for _, path in _image_tokens.values():
+        remove_path(path)
+    _batches.clear()
+    _image_tokens.clear()
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
