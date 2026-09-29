@@ -10,7 +10,7 @@ A Telegram bot for common image and document tasks. The project is public and we
 - Package a batch of files into a ZIP archive.
 - Clear a user's current batch with /clear.
 
-### Image size notes
+### Image editing and background removal\n\nSend a photo and use the inline buttons to convert, compress, or apply edits. `/resize 1200 800` resizes the latest available photo to exact dimensions (1–10000 pixels per side). This exact resize may change the original aspect ratio. Basic editing uses Pillow and does not call a paid API.\n\nBackground removal is optional: install it with `python -m pip install -r requirements-ai.txt` before running the bot. The open-source AI model may download on first use and needs extra memory/CPU; it is not installed in the default deployment.\n\n### Image size notes
 
 The size presets are target ceilings, not promises of exact file size. Compression exports JPEG and reduces quality first; if necessary to meet the selected ceiling, it also reduces pixel dimensions. Transparent PNG/WebP conversion preserves alpha; JPEG conversion flattens transparency onto white. Telegram photo uploads may already be resized/compressed; send as a document when you need to preserve original bytes (subject to the bot's input limit).
 
@@ -42,7 +42,7 @@ Stop with `docker compose down`. The bot uses long polling; run only one active 
 
 ## Deploy on Render
 
-Create a **Background Worker** connected to this repository and the main branch.
+Create a **Web Service** connected to this repository and the main branch.
 
 - Runtime: Python
 - Build command: `pip install -r requirements.txt`
@@ -50,7 +50,7 @@ Create a **Background Worker** connected to this repository and the main branch.
 - Environment variable: `BOT_TOKEN` = your token
 - Root directory: leave blank (repository root)
 
-This bot uses long polling, so use one running worker instance for the bot token. Do not run multiple replicas of this polling bot simultaneously.
+The bot uses long polling plus a small HTTP health endpoint for Render. Use one running instance for the bot token; do not run multiple replicas simultaneously.
 
 ## Current limits and operational notes
 
