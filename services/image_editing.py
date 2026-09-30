@@ -11,7 +11,9 @@ def edit_image(source: Path, target: Path, action: str, width: int = 0, height: 
         if action == "resize":
             if not (1 <= width <= 10000 and 1 <= height <= 10000):
                 raise ValueError("Width and height must each be between 1 and 10000 pixels.")
-            image = ImageOps.fit(image, (width, height), method=Image.Resampling.LANCZOS) if False else image.resize((width, height), Image.Resampling.LANCZOS)
+            resized = image.resize((width, height), Image.Resampling.LANCZOS)
+            image.close()
+            image = resized
         elif action == "rotate": image = image.rotate(90, expand=True)
         elif action == "flip": image = ImageOps.mirror(image)
         elif action == "flop": image = ImageOps.flip(image)
@@ -31,7 +33,10 @@ def edit_image(source: Path, target: Path, action: str, width: int = 0, height: 
         elif action == "saturate": image = ImageEnhance.Color(image).enhance(1.5)
         elif action == "sepia":
             rgb = image.convert("RGB")
-            image = ImageOps.colorize(ImageOps.grayscale(rgb), "#704214", "#fff1d0")
+            gray = ImageOps.grayscale(rgb)
+            rgb.close()
+            image = ImageOps.colorize(gray, "#704214", "#fff1d0")
+            gray.close()
         else: raise ValueError("Unknown edit action.")
         if image.mode not in ("RGB", "RGBA", "L"):
             image = image.convert("RGBA" if "transparency" in image.info else "RGB")
