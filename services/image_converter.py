@@ -89,3 +89,41 @@ def compress_to_target(source: Path, target: Path, target_bytes: int) -> int:
         if current is not image:
             current.close()
         image.close()
+
+
+def increase_to_target(source: Path, target: Path, target_bytes: int) -> int:
+    """Create a JPEG at or above a requested size where reasonably possible."""
+    if target_bytes < 10_000:
+        raise ValueError("Choose a target of at least 10 KB.")
+    image = _load_rgb(source)
+    try:
+        current = image
+        quality = 95
+        # First maximize JPEG quality. If still smaller, upscale progressively.
+        for _ in range(12):
+            buffer = BytesIO()
+            current.save(buffer, format="JPEG", quality=quality, optimize=False, subsampling=0)
+            encoded = buffer.getvalue()
+            if len(encoded) >= target_bytes:
+                target.write_bytes(encoded)
+                return len(encoded)
+            if current.width >= 10000 or current.height >= 10000:
+                target.write_bytes(encoded)
+                return len(encoded)
+            scale = 1.15
+            resized = current.resize(
+                (min(10000, max(current.width + 1, int(current.width * scale))),
+                 min(10000, max(current.height + 1, int(current.height * scale)))),
+                Image.Resampling.LANCZOS,
+            )
+            if current is not image:
+                current.close()
+            current = resized
+        buffer = BytesIO()
+        current.save(buffer, format="JPEG", quality=95, optimize=False, subsampling=0)
+        target.write_bytes(buffer.getvalue())
+        return target.stat().st_size
+    finally:
+        if 'current' in locals() and current is not image:
+            current.close()
+        image.close()
