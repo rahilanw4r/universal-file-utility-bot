@@ -13,7 +13,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import MAX_FILE_SIZE_BYTES, MAX_BATCH_FILES, TEMP_DIR
 from services.file_compressor import create_zip
-from services.image_converter import compress_to_target, convert_image
+from services.image_converter import compress_to_target, convert_image, increase_to_target
 from services.image_editing import edit_image, remove_background
 from services.pdf_tools import merge_pdfs
 from utils.file_manager import remove_path, safe_suffix
@@ -27,6 +27,7 @@ _batches: dict[int, list[Path]] = {}
 _image_tokens: dict[str, tuple[int, Path]] = {}
 _user_locks: dict[int, asyncio.Lock] = {}
 _job_slots = asyncio.Semaphore(2)
+_pending_input: dict[int, tuple[str, str]] = {}
 
 
 def _lock_for(user_id: int) -> asyncio.Lock:
@@ -39,7 +40,7 @@ def _keyboard(token: str):
         builder.button(text=label, callback_data=f"img:{token}:{fmt}")
     for label, kb in (("≤250 KB", "250"), ("≤500 KB", "500"), ("≤1 MB", "1024"), ("≤2 MB", "2048")):
         builder.button(text=label, callback_data=f"img:{token}:kb{kb}")
-    for label, action in (("Rotate 90°", "rotate"), ("Mirror", "flip"), ("Flip", "flop"), ("Grayscale", "gray"), ("Sepia", "sepia"), ("Blur", "blur"), ("Sharpen", "sharpen"), ("Brighten", "bright"), ("Darken", "dark"), ("Contrast", "contrast"), ("Saturate", "saturate"), ("Auto contrast", "autocontrast"), ("Remove BG", "bg")):
+    for label, action in (("Resize", "resize"), ("Custom KB/MB", "customsize"), ("Rotate 90°", "rotate"), ("Mirror", "flip"), ("Flip", "flop"), ("Grayscale", "gray"), ("Sepia", "sepia"), ("Blur", "blur"), ("Sharpen", "sharpen"), ("Brighten", "bright"), ("Darken", "dark"), ("Contrast", "contrast"), ("Saturate", "saturate"), ("Auto contrast", "autocontrast"), ("Remove BG", "bg")):
         builder.button(text=label, callback_data=f"edit:{token}:{action}")
     builder.adjust(3, 2, 2, 2, 2, 2, 2, 2)
     return builder.as_markup()
@@ -166,10 +167,20 @@ async def image_edit_callback(callback: CallbackQuery) -> None:
     _, token, action = parts
     entry = _image_tokens.get(token)
     allowed = {"rotate", "flip", "flop", "gray", "invert", "autocontrast", "blur", "sharpen",
-               "bright", "dark", "contrast", "saturate", "sepia", "bg"}
+               "bright", "dark", "contrast", "saturate", "sepia", "bg", "resize", "customsize"}
     if action not in allowed or not entry or entry[0] != callback.from_user.id:
         await callback.answer("This image action is invalid or expired.", show_alert=True)
         return
+
+    if action in {"resize", "customsize"}:
+        _pending_input[callback.from_user.id] = (action, token)
+        prompt = ("Resize mode activated. Send dimensions like 1200 800 or 1200x800."
+                  if action == "resize" else
+                  "Custom size mode activated. Send 500 KB or 2 MB for a maximum size. Use +2 MB for a minimum size.")
+        await callback.message.answer(prompt)
+        await callback.answer()
+        return
+
     source = entry[1]
     target = source.with_name(f"{uuid4().hex}.png")
     try:
@@ -192,33 +203,71 @@ async def image_edit_callback(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-@router.message(Command("resize"))
-async def resize_handler(message: Message) -> None:
-    if not message.from_user:
+@router.message(lambda m: m.text and m.from_user and m.from_user.id in _pending_input)
+async def custom_image_input_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    action, token = _pending_input.pop(user_id)
+    entry = _image_tokens.get(token)
+    if not entry or entry[0] != user_id:
+        await message.answer("That image session expired. Send the image again.")
         return
-    args = (message.text or "").split()
-    if len(args) != 3 or not all(arg.isdigit() for arg in args[1:]):
-        await message.answer("Usage: /resize WIDTH HEIGHT (pixels), e.g. /resize 1200 800. Send a photo first.")
+    source = entry[1]
+
+    if action == "resize":
+        raw = (message.text or "").lower().replace("×", "x").replace(",", " ")
+        parts = raw.replace("x", " ").split()
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            _pending_input[user_id] = (action, token)
+            await message.answer("Invalid dimensions. Send them like 1200 800 or 1200x800.")
+            return
+        width, height = map(int, parts)
+        target = source.with_name(f"{uuid4().hex}.png")
+        try:
+            async with _job_slots:
+                await asyncio.to_thread(edit_image, source, target, "resize", width, height)
+            if target.stat().st_size > MAX_FILE_SIZE_BYTES:
+                await message.answer("The resized image is too large to send.")
+            else:
+                await message.answer_document(FSInputFile(target), caption=f"Resized to {width} × {height} px")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            _pending_input[user_id] = (action, token)
+        except Exception:
+            log.exception("Custom resize failed for user_id=%s", user_id)
+            await message.answer("Couldn't resize this image.")
+        finally:
+            remove_path(target)
         return
-    width, height = int(args[1]), int(args[2])
-    token_entry = next((entry for entry in reversed(list(_image_tokens.values())) if entry[0] == message.from_user.id), None)
-    if not token_entry:
-        await message.answer("Send a photo first, then use /resize WIDTH HEIGHT.")
+
+    raw = (message.text or "").strip().lower()
+    minimum = raw.startswith("+")
+    raw = raw.lstrip("+").strip()
+    import re
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(kb|kib|mb|mib)", raw)
+    if not match:
+        _pending_input[user_id] = (action, token)
+        await message.answer("Invalid size. Example: 500 KB, 2 MB, or +2 MB.")
         return
-    source = token_entry[1]
-    target = source.with_name(f"{uuid4().hex}.png")
+    value, unit = float(match.group(1)), match.group(2)
+    multiplier = 1024 if unit in {"kb", "kib"} else 1024 * 1024
+    target_bytes = int(value * multiplier)
+    if target_bytes < 10 * 1024 or target_bytes > MAX_FILE_SIZE_BYTES:
+        _pending_input[user_id] = (action, token)
+        await message.answer(f"Choose between 10 KB and {MAX_FILE_SIZE_BYTES // 1048576} MB.")
+        return
+
+    target = source.with_name(f"{uuid4().hex}.jpg")
     try:
         async with _job_slots:
-            await asyncio.to_thread(edit_image, source, target, "resize", width, height)
-        if target.stat().st_size > MAX_FILE_SIZE_BYTES:
-            await message.answer("Resized image exceeds the bot's send limit.")
-        else:
-            await message.answer_document(FSInputFile(target), caption=f"Resized to {width} × {height} px")
-    except ValueError as exc:
-        await message.answer(str(exc))
+            if minimum:
+                actual = await asyncio.to_thread(increase_to_target, source, target, target_bytes)
+            else:
+                actual = await asyncio.to_thread(compress_to_target, source, target, target_bytes)
+        await message.answer_document(FSInputFile(target),
+            caption=f"JPEG: {actual / 1024:.1f} KB (target {'≥' if minimum else '≤'} {value:g} {unit.upper()})")
     except Exception:
-        log.exception("Manual resize failed for user_id=%s", message.from_user.id)
-        await message.answer("Couldn't resize this image.")
+        log.exception("Custom size processing failed for user_id=%s", user_id)
+        await message.answer("Couldn't reach that file-size target with this image.")
     finally:
         remove_path(target)
 
