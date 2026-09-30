@@ -237,6 +237,8 @@ async def custom_image_input_handler(message: Message) -> None:
             await message.answer("Couldn't resize this image.")
         finally:
             remove_path(target)
+            _image_tokens.pop(token, None)
+            remove_path(source)
         return
 
     raw = (message.text or "").strip().lower()
@@ -263,6 +265,9 @@ async def custom_image_input_handler(message: Message) -> None:
                 actual = await asyncio.to_thread(increase_to_target, source, target, target_bytes)
             else:
                 actual = await asyncio.to_thread(compress_to_target, source, target, target_bytes)
+        if actual > MAX_FILE_SIZE_BYTES:
+            await message.answer(f"Result is {actual / 1024 / 1024:.2f} MB, above the bot send limit. Try a smaller target.")
+            return
         await message.answer_document(FSInputFile(target),
             caption=f"JPEG: {actual / 1024:.1f} KB (target {'≥' if minimum else '≤'} {value:g} {unit.upper()})")
     except Exception:
@@ -270,6 +275,8 @@ async def custom_image_input_handler(message: Message) -> None:
         await message.answer("Couldn't reach that file-size target with this image.")
     finally:
         remove_path(target)
+        _image_tokens.pop(token, None)
+        remove_path(source)
 
 
 async def _take_batch(user_id: int) -> list[Path]:
@@ -354,4 +361,5 @@ async def cleanup() -> None:
         remove_path(path)
     _batches.clear()
     _image_tokens.clear()
+    _pending_input.clear()
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
