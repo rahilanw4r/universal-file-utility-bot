@@ -27,7 +27,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server() -> HTTPServer:
     """Bind the HTTP health endpoint to Render's assigned port."""
-    port = int(os.environ.get("PORT", "8080"))
+    port = int(os.environ.get("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
